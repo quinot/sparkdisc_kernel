@@ -1,0 +1,76 @@
+#! /bin/bash
+
+set -e
+
+prefix=${HOME}/.local/sparkdisc
+
+echo "::: Preparing SPARK Discovery environment in ${prefix}"
+
+mkdir -p ${prefix}
+cd binder
+
+echo "::: Install GNAT GPL 2017"
+curl -LJO http://mirrors.cdn.adacore.com/art/591c6d80c7a447af2deed1d7
+archive=`echo gnat-gpl-*.tar.gz`
+echo "9682e2e1f2f232ce03fe21d77b14c37a0de5649b ${archive}" | sha1sum -c -
+tar xzf ${archive}
+(cd ${archive%.tar.gz} && (echo "";echo ${prefix}; echo y;echo y) | ./doinstall)
+
+echo "::: Install SPARK Discovery 2017"
+
+curl -LJO http://mirrors.cdn.adacore.com/art/592c5299c7a447388d5c991d
+archive=`echo spark-discovery*.tar.gz`
+echo "a70d75c71508ed3ab0ecb4a34fcc1dff9a9d9089 ${archive}" | sha1sum -c -
+tar xzf ${archive}
+(cd ${archive%.tar.gz} && (echo ${prefix}; echo y) | ./doinstall)
+
+# Patch for CVC4
+
+sed -i -e "s% --boolean-term-conversion-mode=native%%g" ${prefix}/share/spark/config/why3.conf
+
+echo "::: Install CVC4"
+
+curl -Lo ${prefix}/bin/cvc4 http://cvc4.cs.stanford.edu/downloads/builds/x86_64-linux-opt/cvc4-1.5-x86_64-linux-opt
+echo "fa36906579e2c25af23f4eac6ce191195aa0575b ${prefix}/bin/cvc4" | sha1sum -c -
+chmod +x ${prefix}/bin/cvc4
+
+echo "::: Install Z3"
+
+curl -LO https://github.com/Z3Prover/z3/releases/download/z3-4.5.0/z3-4.5.0-x64-ubuntu-14.04.zip
+echo "358fb3579270dcb7ab8ab0d53a8ab389f223e216 z3-4.5.0-x64-ubuntu-14.04.zip" | sha1sum -c -
+unzip z3-4.5.0-x64-ubuntu-14.04.zip -d ${prefix}
+ln -s z3-4.5.0-x64-ubuntu-14.04/bin/z3 ${prefix}/bin
+
+echo "::: Installing kernel"
+pip install .
+
+kspec=kernelspec/sparkdisc_kernel
+cat > ${kspec}/kernel.json << EOF
+{
+    "argv": [
+        "python", "-m", "sparkdisc_kernel", "-f", "{connection_file}"
+    ],
+    "display_name": "SPARK Discovery",
+    "language": "SPARK",
+    "language_version": "SPARK 2014",
+    "env": {
+        "PATH":   "$prefix/bin:$PATH"
+    }
+}
+EOF
+jupyter kernelspec install ${kspec} --user
+
+echo "::: Listing installed kernels"
+jupyter kernelspec list
+
+echo "::: Install and enable tag_exec extension"
+curl -LO https://gist.githubusercontent.com/quinot/e3801b09f754efb0f39ccfbf0b50eb40/raw/c1314d60d29564c01c69d5bbf20cf4732ea9fc35/tag_exec.js
+jupyter nbextension install tag_exec.js --user
+jupyter nbextension enable tag_exec --user
+
+echo "::: Cleaning up"
+cd ..
+rm -fr binder
+mkdir work
+
+echo "::: Done"
