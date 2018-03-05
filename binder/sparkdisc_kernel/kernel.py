@@ -5,23 +5,29 @@ from queue import Queue
 from threading import Thread
 
 from ipykernel.kernelbase import Kernel
+import re
 import subprocess
 import tempfile
 import os
 from shlex import split as shsplit
 
 msg_prefix = "[SPARK Discovery kernel] "
+gnatprove_error_re = re.compile(b"([a-zA-Z._-]+):(\d+):(\d+):(.+)")
+
 
 class RealTimeSubprocess(subprocess.Popen):
     """
     A subprocess that allows to read its stdout and stderr in real time
     """
 
-    def __init__(self, cmd, write_to_stdout, write_to_stderr):
+    def __init__(self, cmd, write_to_stdout, write_to_stderr, line_filter):
         """
         :param cmd: the command to execute
-        :param write_to_stdout: a callable that will be called with chunks of data from stdout
-        :param write_to_stderr: a callable that will be called with chunks of data from stderr
+        :param write_to_stdout: function called with chunks of data from stdout
+        :param write_to_stderr: function called with chunks of data from stderr
+        :param function|None line_filter:
+            if present, function to transform each stdout line (takes bytes and
+            returns bytes or None)
         """
         self._write_to_stdout = write_to_stdout
         self._write_to_stderr = write_to_stderr
@@ -29,22 +35,31 @@ class RealTimeSubprocess(subprocess.Popen):
         super().__init__(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
 
         self._stdout_queue = Queue()
-        self._stdout_thread = Thread(target=RealTimeSubprocess._enqueue_output, args=(self.stdout, self._stdout_queue))
+        self._stdout_thread = Thread(target=RealTimeSubprocess._enqueue_output,
+                                     args=(self.stdout, self._stdout_queue, line_filter))
         self._stdout_thread.daemon = True
         self._stdout_thread.start()
 
         self._stderr_queue = Queue()
-        self._stderr_thread = Thread(target=RealTimeSubprocess._enqueue_output, args=(self.stderr, self._stderr_queue))
+        self._stderr_thread = Thread(target=RealTimeSubprocess._enqueue_output,
+                                     args=(self.stderr, self._stderr_queue))
         self._stderr_thread.daemon = True
         self._stderr_thread.start()
 
     @staticmethod
-    def _enqueue_output(stream, queue):
+    def _enqueue_output(stream, queue, line_filter):
         """
         Add chunks of data from a stream to a queue until the stream is empty.
         """
-        for line in iter(lambda: stream.read(4096), b''):
-            queue.put(line)
+        if line_filter is None:
+            for line in iter(lambda: stream.read(4096), b""):
+                queue.put(line)
+        else:
+            for line in iter(stream.readline, b""):
+                line = line_filter(line)
+                if line is not None:
+                    queue.put(line)
+
         stream.close()
 
     def write_contents(self):
@@ -80,7 +95,6 @@ class SPARKDiscKernel(Kernel):
     banner = "SPARK Discovery kernel.\n" \
              "Creates source code files and executables in a temporary folder.\n"
 
-
     def __init__(self, *args, **kwargs):
         super(SPARKDiscKernel, self).__init__(*args, **kwargs)
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -91,13 +105,14 @@ class SPARKDiscKernel(Kernel):
     def _write_to_stderr(self, contents):
         self.send_response(self.iopub_socket, 'stream', {'name': 'stderr', 'text': contents})
 
-    def create_jupyter_subprocess(self, cmd):
+    def create_jupyter_subprocess(self, cmd, line_filter):
         return RealTimeSubprocess(cmd,
                                   lambda contents: self._write_to_stdout(contents.decode()),
-                                  lambda contents: self._write_to_stderr(contents.decode()))
+                                  lambda contents: self._write_to_stderr(contents.decode()),
+                                  line_filter)
 
-    def runcmd(self, cmd):
-        p = self.create_jupyter_subprocess(cmd)
+    def runcmd(self, cmd, line_filter=None):
+        p = self.create_jupyter_subprocess(cmd, line_filter)
         while p.poll() is None:
             p.write_contents()
         p.write_contents()
@@ -107,8 +122,7 @@ class SPARKDiscKernel(Kernel):
 
         magics = {'cflags': [],
                   'ldflags': [],
-                  'args': [],
-                }
+                  'args': []}
 
         for line in code.splitlines():
             line = line.strip()
@@ -129,11 +143,12 @@ class SPARKDiscKernel(Kernel):
         return self.metadata
 
     def msg(self, msg, *args, **kwargs):
-        color = kwargs.pop("color")
+        color = kwargs.pop("color", None)
         self._write_to_stdout((color if color else "") +
                               msg_prefix +
-                              msg.format(kwargs) +
-                              (Style.RESET_ALL if color else ""))
+                              msg.format(*args, **kwargs) +
+                              (Style.RESET_ALL if color else "") +
+                              "\n")
 
     def err(self, msg, *args, **kwargs):
         self._write_to_stderr(msg_prefix + msg.format(*args, **kwargs))
@@ -177,9 +192,35 @@ class SPARKDiscKernel(Kernel):
 
         # Call prover
 
-        rc = self.runcmd(['gnatprove', '-P', 'main'])
+        error_count = [0]
+        # Note: This is a list, not a simple int variable, because we
+        # need it to be a mutable object so that we can modify the
+        # value from within the gnatprove_filter function below.
+
+        def gnatprove_filter(line):
+            """Filter a line of gnatprove output
+
+            Tally errors in error_count[0]; suppress "Summary logged" line.
+
+            :param bytes line: line of intput
+            :rtype: bytes|None
+            """
+
+            if line.startswith(b"Summary logged"):
+                return None
+            if gnatprove_error_re.match(line):
+                error_count[0] += 1
+            return line
+
+        rc = self.runcmd(['gnatprove', '-P', 'main'], line_filter = gnatprove_filter)
         if rc != 0:
             return self.fail("gnatprove exited with status {0}", rc)
+
+        if error_count[0] == 0:
+            self.msg("Success!", color=Fore.GREEN)
+        else:
+            self.msg("{0} error{s}", error_count[0], s="s" if error_count[0] > 1 else "", color=Fore.RED)
+            return self.fail("gnatprove failed")
 
         # Call builder and run program
 
@@ -195,4 +236,5 @@ class SPARKDiscKernel(Kernel):
         if rc == 0:
             self.msg("Success!", color=Fore.GREEN)
 
-        return {'status': 'ok', 'execution_count': self.execution_count, 'payload': [], 'user_expressions': {}}
+        return {'status': 'ok', 'execution_count': self.execution_count,
+                'payload': [], 'user_expressions': {}}
