@@ -85,13 +85,15 @@ class RealTimeSubprocess(subprocess.Popen):
 
 
 class SPARKDiscKernel(Kernel):
-    implementation = 'sparkdisc_kernel'
-    implementation_version = '0.1'
-    language = 'SPARK'
-    language_version = 'SPARK 2014'
-    language_info = {'name': 'spark',
-                     'mimetype': 'text/plain',
-                     'file_extension': '.ada'}
+    implementation = "sparkdisc_kernel"
+    implementation_version = "0.1"
+    language = "SPARK"
+    language_version = "SPARK 2014"
+    language_info = {"name": "spark",
+                     "mimetype": "text/plain",
+                     "file_extension": ".ada",
+                     "codemirror_mode": "ada",
+                     "pygments_lexer": "ada"}
     banner = "SPARK Discovery kernel.\n" \
              "Creates source code files and executables in a temporary folder.\n"
 
