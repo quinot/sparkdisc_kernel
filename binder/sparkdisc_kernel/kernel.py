@@ -183,12 +183,13 @@ class SPARKDiscKernel(Kernel):
 
         # Call builder and run program
 
-        if "run" in self.metadata.get("tags", []):
-            rc = self.runcmd(['gprbuild', '-q', '-P', 'main'])
+        main_unit = self.metadata.get("main")
+        if main_unit is not None:
+            rc = self.runcmd(['gprbuild', '-q', '-P', 'main', main_unit])
             if rc != 0:
                 return self.fail("gprbuild exited with status {0}", rc)
 
-            rc = self.runcmd(["./main"] + magics['args'])
+            rc = self.runcmd([os.path.join(".", main_unit)] + magics['args'])
             return self.fail("executable exited with status {0}", rc)
 
         if rc == 0:
