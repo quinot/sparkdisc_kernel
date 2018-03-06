@@ -29,60 +29,62 @@ class RealTimeSubprocess(subprocess.Popen):
             if present, function to transform each stdout line (takes bytes and
             returns bytes or None)
         """
-        self._write_to_stdout = write_to_stdout
-        self._write_to_stderr = write_to_stderr
+        self._write = {"out": write_to_stdout, "err": write_to_stderr}
+        self._line_filter = line_filter
 
-        super().__init__(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        super(RealTimeSubprocess, self).__init__(cmd,
+                                                 stdout=subprocess.PIPE,
+                                                 stderr=subprocess.PIPE,
+                                                 bufsize=1,  # Line buffered
+                                                 close_fds=True)
 
-        self._stdout_queue = Queue()
-        self._stdout_thread = Thread(target=RealTimeSubprocess._enqueue_output,
-                                     args=(self.stdout, self._stdout_queue, line_filter))
-        self._stdout_thread.daemon = True
-        self._stdout_thread.start()
+        self._queue = Queue()
+        self._threads = {}
 
-        self._stderr_queue = Queue()
-        self._stderr_thread = Thread(target=RealTimeSubprocess._enqueue_output,
-                                     args=(self.stderr, self._stderr_queue))
-        self._stderr_thread.daemon = True
-        self._stderr_thread.start()
+        for name, stream in (("out", self.stdout), ("err", self.stderr)):
+            thread = Thread(target=RealTimeSubprocess._enqueue_output,
+                            args=(stream, self._queue, name))
+            thread.daemon = True
+            thread.start()
+            self._threads[name] = thread
 
     @staticmethod
-    def _enqueue_output(stream, queue, line_filter):
+    def _enqueue_output(stream, queue, what):
         """
         Add chunks of data from a stream to a queue until the stream is empty.
         """
-        if line_filter is None:
-            for line in iter(lambda: stream.read(4096), b""):
-                queue.put(line)
-        else:
-            for line in iter(stream.readline, b""):
-                line = line_filter(line)
-                if line is not None:
-                    queue.put(line)
+        for line in iter(stream.readline, b""):
+            queue.put((what, line))
 
-        stream.close()
+        # Signal main thread that this output stream is closed
+
+        queue.put((what, None))
 
     def write_contents(self):
         """
         Write the available content from stdin and stderr where specified when the instance was created
+
+        This blocks until data is available on the queue. This terminates when both queueing threads
+        have signalled that their respective streams are closed.
+
         :return:
         """
 
-        def read_all_from_queue(queue):
-            res = b''
-            size = queue.qsize()
-            while size != 0:
-                res += queue.get_nowait()
-                size -= 1
-            return res
+        while True:
+            what, line = self._queue.get()
+            if line is None:
+                self._threads[what].join()
 
-        stdout_contents = read_all_from_queue(self._stdout_queue)
-        if stdout_contents:
-            self._write_to_stdout(stdout_contents)
-        stderr_contents = read_all_from_queue(self._stderr_queue)
-        if stderr_contents:
-            self._write_to_stderr(stderr_contents)
+            else:
+                if self._line_filter is not None:
+                    line = self._line_filter(line)
+                if line is not None:
+                    self._write[what](line)
 
+            # Return if queue is empty and both threads are dead
+
+            if self._queue.empty() and all(not t.is_alive() for t in self._threads.values()):
+                break
 
 class SPARKDiscKernel(Kernel):
     implementation = "sparkdisc_kernel"
@@ -115,9 +117,12 @@ class SPARKDiscKernel(Kernel):
 
     def runcmd(self, cmd, line_filter=None):
         p = self.create_jupyter_subprocess(cmd, line_filter)
-        while p.poll() is None:
-            p.write_contents()
         p.write_contents()
+
+        # Here when both stdout and stderr have been closed: collect
+        # child process's return code.
+
+        p.wait()
         return p.returncode
 
     def _filter_magics(self, code):
@@ -210,8 +215,11 @@ class SPARKDiscKernel(Kernel):
 
             if line.startswith(b"Summary logged"):
                 return None
+
             if gnatprove_error_re.match(line):
                 error_count[0] += 1
+                line = bytes(Fore.RED, "ascii") + line
+
             return line
 
         rc = self.runcmd(['gnatprove', '-P', 'main'], line_filter = gnatprove_filter)
@@ -234,9 +242,6 @@ class SPARKDiscKernel(Kernel):
 
             rc = self.runcmd([os.path.join(".", main_unit)] + magics['args'])
             return self.fail("executable exited with status {0}", rc)
-
-        if rc == 0:
-            self.msg("Success!", color=Fore.GREEN)
 
         return {'status': 'ok', 'execution_count': self.execution_count,
                 'payload': [], 'user_expressions': {}}
